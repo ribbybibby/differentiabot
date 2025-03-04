@@ -1,0 +1,139 @@
+# Copyright 2025 Chainguard, Inc.
+# SPDX-License-Identifier: Apache-2.0
+name: 'Chainctl Diff for Digestabot'
+description: 'Run `chainctl image diff` on changes made by digestabot.'
+
+inputs:
+  token:
+    description: 'GITHUB_TOKEN or a `repo` scoped Personal Access Token (PAT)'
+    required: true
+    default: ${{ github.token }}
+  json:
+    description: 'The `json` output from `digestabot`.'
+    required: true
+  pull_request_number:
+    description: 'The pull request to comment the results to.'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Grype
+      uses: anchore/scan-action/download-grype@v3
+
+    - name: Chainctl Diff
+      shell: bash
+      id: chainctl_diff
+      env:
+        JSON: ${{ inputs.json }}
+      run: |
+        # Start the body of the comment
+        echo 'body<<EOF' >> "${GITHUB_OUTPUT}"
+
+        while read -r line; do
+           from_image=$(jq -r '.image + "@" + .digest' <<<$line)
+           to_image=$(jq -r '.image + "@" + .updated_digest' <<<$line)
+
+           # Store the diff output in a filename derived from the images. We can
+           # use this to avoid diffing the same images more than once.
+           diff_file="$(sha256sum <<<"${from_image}+${to_image}" | awk '{print $1}').json"
+
+           # Skip image updates we've already processed
+           if [[ -f "${diff_file}" ]]; then
+             echo "Skipping because we've already processed the change; from=${from_image} to=${to_image}"
+             continue
+           fi
+
+           # Skip non-chainguard images
+           if [[ ! "${from_image}" =~ ^cgr.dev/.+$ ]] || [[ ! "${to_image}" =~ ^cgr.dev/.+$ ]]; then
+             echo "Skipping because we only support Chainguard images; from=${from_image} to=${to_image}"
+             continue
+           fi
+
+           echo "Processing from=${from_image} to=${to_image}"
+
+           # Perform the diff, save it to the file
+           chainctl images diff -o json "${from_image}" "${to_image}" > "${diff_file}"
+
+           # Construct the header for the image 
+           echo "## ${to_image%@*}" >> "${GITHUB_OUTPUT}"
+           echo '|      | Digest               |' >> "${GITHUB_OUTPUT}"
+           echo '| ---- | -------------------- |' >> "${GITHUB_OUTPUT}"
+           echo "| From | \`${from_image#*@}\` |" >> "${GITHUB_OUTPUT}"
+           echo "| To   | \`${to_image#*@}\`   |" >> "${GITHUB_OUTPUT}"
+
+           # Put the diff information inside a <details> block so it's
+           # collapsible
+           echo '' >> "${GITHUB_OUTPUT}"
+           echo '<details>' >> "${GITHUB_OUTPUT}"
+           echo '' >> "${GITHUB_OUTPUT}"
+
+           # Vulnerabilities added
+           vulnerabilities_added=$(jq -r '.vulnerabilities.added // [] | .[] | "|" + .id + "|" + .reference + "|" + .severity + "|"' "${diff_file}")
+           if [ ! -z "${vulnerabilities_added}" ]; then
+             echo '### Vulnerabilities Added' >> "${GITHUB_OUTPUT}"
+             echo '| Id | Reference | Severity |' >> "${GITHUB_OUTPUT}"
+             echo '| -- | --------- | -------- |' >> "${GITHUB_OUTPUT}"
+             echo "${vulnerabilities_added}" >> "${GITHUB_OUTPUT}"
+           fi
+
+           # Vulnerabilities removed
+           vulnerabilities_removed=$(jq -r '.vulnerabilities.removed // [] | .[] | "|" + .id + "|" + .reference + "|" + .severity + "|"' "${diff_file}")
+           if [ ! -z "${vulnerabilities_removed}" ]; then
+             echo '### Vulnerabilities Removed' >> "${GITHUB_OUTPUT}"
+             echo '| Id | Reference | Severity |' >> "${GITHUB_OUTPUT}"
+             echo '| -- | --------- | -------- |' >> "${GITHUB_OUTPUT}"
+             echo "${vulnerabilities_removed}" >> "${GITHUB_OUTPUT}"
+           fi
+
+           # Packages added
+           packages_added=$(jq -r '.packages.added // [] | .[] | select(.reference | startswith("pkg:apk/")) | "|" + .name + "|" + .version + "|" + .reference + "|"' "${diff_file}")
+           if [ ! -z "${packages_added}" ]; then
+             echo '### Packages Added' >> "${GITHUB_OUTPUT}"
+             echo '| Name | Version | Reference |' >> "${GITHUB_OUTPUT}"
+             echo '| ---- | ------- | --------- |' >> "${GITHUB_OUTPUT}"
+             echo "${packages_added}" >> "${GITHUB_OUTPUT}"
+           fi
+
+           # Packages removed
+           packages_removed=$(jq -r '.packages.removed // [] | .[] | select(.reference | startswith("pkg:apk/")) | "|" + .name + "|" + .version + "|" + .reference + "|"' "${diff_file}")
+           if [ ! -z "${packages_removed}" ]; then
+             echo '### Packages Removed' >> "${GITHUB_OUTPUT}"
+             echo '| Name | Version | Reference |' >> "${GITHUB_OUTPUT}"
+             echo '| ---- | ------- | --------- |' >> "${GITHUB_OUTPUT}"
+             echo "${packages_removed}" >> "${GITHUB_OUTPUT}"
+           fi
+
+           # If there are no changes, then note that in the body.
+           if [ -z "${packages_added}" ] && [ -z "${packages_removed}" ] && [ -z "${vulnerabilities_added}" ] && [ -z "${vulnerabilities_removed}" ]; then
+             echo 'No changes.' >> "${GITHUB_OUTPUT}"
+           fi
+
+           # Close the details block
+           echo '' >> "${GITHUB_OUTPUT}"
+           echo '</details>' >> "${GITHUB_OUTPUT}"
+           echo '' >> "${GITHUB_OUTPUT}"
+
+         done < <(jq -c '.updates // [] | .[]' <<<"${JSON}")
+
+         # Close the body
+         echo 'EOF' >> "${GITHUB_OUTPUT}"
+
+    - name: Find Comment
+      uses: peter-evans/find-comment@v3
+      id: find-comment
+      with:
+        issue-number: ${{ inputs.pull_request_number }}
+        comment-author: 'github-actions[bot]'
+        body-includes: 'Results of `chainctl image diff` for each image update.'
+
+    - name: Create or Update Comment
+      uses: peter-evans/create-or-update-comment@v4
+      with:
+        comment-id: ${{ steps.find-comment.outputs.comment-id }}
+        issue-number: ${{ inputs.pull_request_number }}
+        body: |
+          Results of `chainctl image diff` for each image update.
+          ${{ steps.chainctl_diff.outputs.body }}
+        token: ${{ inputs.token }}
+        edit-mode: replace
