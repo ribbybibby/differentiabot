@@ -1,0 +1,318 @@
+name: 'Update the image digest'
+description: 'Update the image digest when have a mutating tag'
+
+inputs:
+  working-dir:
+    description: Working directory to run the digestabot, to run in a specific path, if not set will run from the root
+    required: false
+    default: .
+  token:
+    description: 'GITHUB_TOKEN or a `repo` scoped Personal Access Token (PAT)'
+    required: true
+    default: ${{ github.token }}
+  signoff:
+    description: 'Add `Signed-off-by` line by the committer at the end of the commit log message.'
+    default: false
+  author:
+    description: >
+      The author name and email address in the format `Display Name <email@address.com>`.
+      Defaults to the user who triggered the workflow run.
+    default: '${{ github.actor }} <${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com>'
+  committer:
+    description: >
+      The committer name and email address in the format `Display Name <email@address.com>`.
+      Defaults to the GitHub Actions bot user.
+    default: 'github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>'
+  labels-for-pr:
+    description: 'A comma or newline separated list of labels to be used in the pull request.'
+    default: automated pr, kind/cleanup, release-note-none
+  branch-for-pr:
+    description: 'The pull request branch name.'
+    default: 'update-digests'
+  title-for-pr:
+    description: 'The title of the pull request.'
+    default: 'Update images digests'
+  description-for-pr:
+    description: 'The description of the pull request.'
+    default: 'Update images digests'
+  commit-message:
+    description: 'The message to use when committing changes.'
+    default: 'Update images digests'
+  create-pr:
+    description: 'Create a PR or just keep the changes locally.'
+    default: true
+  use-gitsign:
+    description: 'Use gitsign to sign commits.'
+    default: 'true'
+  only-removed-vulnerabilities:
+    description: 'Only PR image updates that remove vulnerabilities.'
+    default: false
+
+outputs:
+  pull_request_number:
+    description: "Pull Request Number"
+    value: ${{ steps.pull_request.outputs.pull-request-number }}
+
+runs:
+  using: "composite"
+  steps:
+    # Intall grype
+    - uses: anchore/scan-action/download-grype@v3
+
+    # Run digestabot but don't create the PR.
+    - uses: chainguard-dev/digestabot@main
+      id: digestabot
+      with:
+        token: ${{ inputs.token }}
+        create-pr: false
+
+    # Revert the changes made by digestabot.
+    - shell: bash
+      run: |
+        git reset --hard && git clean -fd
+
+    # Iterate over the changes digestabot wanted to make. Scan each image and
+    # figure out the differences.
+    #
+    # This will write a file to /tmp/output.json with this structure which will
+    # be consumed by subsequent steps.
+    #
+    # [
+    #   {
+    #     "image": "",
+    #     "digest": "",
+    #     "updated_digest": "",
+    #     "files": [
+    #       ""
+    #     ],
+    #     "vulnerabilities": {
+    #       "found": [
+    #         {
+    #           "id": "",
+    #           "dataSource": "",
+    #           "severity": ""
+    #         }
+    #       ],
+    #       "added": [
+    #         {
+    #           "id": "",
+    #           "dataSource": "",
+    #           "severity": ""
+    #         }
+    #       ],
+    #       "removed": [
+    #         {
+    #           "id": "",
+    #           "dataSource": "",
+    #           "severity": ""
+    #         }
+    #       ]
+    #     }
+    #   }
+    # ]
+    - id: diff
+      shell: bash
+      run: |
+        # Create a temporary directory to write files to
+        tmpdir=$(mktemp -d)
+
+        # Create the JSON output
+        json='[]'
+
+        # Iterate over the output from digestabot
+        while read -r item; do
+          # Read values from the JSON into variables
+          image=$(jq -r '.image' <<<$item)
+          digest=$(jq -r '.digest' <<<$item)
+          updated_digest=$(jq -r '.updated_digest' <<<$item)
+          file=$(jq -r '.file' <<<$item)
+          from_image=$(jq -r '.image + "@" + .digest' <<<$item)
+          to_image=$(jq -r '.image + "@" + .updated_digest' <<<$item)
+
+          # Create a workdir derived from the images we're diffing
+          workdir="${tmpdir}/$(echo "${to_image}+${from_image}" | sha256sum | awk '{print $1}')"
+          mkdir -p "${workdir}"
+
+          echo "Processing ${to_image} in ${file}"
+
+          # If we've already diffed these images then all we need to do is add
+          # the file to the corresponding entry in the output 
+          if [[ -f "${workdir}/diff.json" ]]; then
+            json=$(jq -c \
+              --arg file "${file}" \
+              --arg image "${image}" \
+              --arg digest "${digest}" \
+              --arg updated_digest "${updated_digest}" \
+              'map(if .image == $image and .digest == $digest and .updated_digest == $updated_digest then .files += [$file] else . end)' <<<"${json}")
+            continue
+          fi
+
+          # Scan both images with Grype
+          echo "Scanning ${from_image} with grype"
+          grype "${from_image}" --add-cpes-if-none -o json > "${workdir}/from.json"
+          echo "Scanning ${to_image} with grype"
+          grype "${to_image}" --add-cpes-if-none -o json > "${workdir}/to.json"
+
+          # Construct a summary of the differences between the two scans.
+          jq -n \
+            --arg file "${file}" \
+            --arg image "${image}" \
+            --arg digest "${digest}" \
+            --arg updated_digest "${updated_digest}" \
+            --slurpfile from "${workdir}/from.json" \
+            --slurpfile to "${workdir}/to.json" \
+            '
+            def vuln_map(scan): 
+              reduce (scan.matches // [] | .[].vulnerability) as $match ({}; .[$match.id] = $match);
+            def sort_vulns(vulns):
+              vulns |
+                sort_by(
+                  .severity | 
+                  if . == "Critical" then 0 
+                  elif . == "High" then 1 
+                  elif . == "Medium" then 2 
+                  elif . == "Low" then 3 
+                  else 4 end
+                );
+            vuln_map($from[0]) as $old
+            | vuln_map($to[0]) as $new
+            | {
+              image: $image,
+              digest: $digest,
+              updated_digest: $updated_digest,
+              files: [$file],
+              vulnerabilities: {
+                found: sort_vulns([$new | to_entries[].value]),
+                added: sort_vulns([$new | to_entries[] | select(.key | in($old) | not) | .value]),
+                removed: sort_vulns([$old | to_entries[] | select(.key | in($new) | not) | .value])
+              }
+            }
+          ' > "${workdir}/diff.json"
+
+          # Append the diff to the json output
+          json=$(jq -c \
+            --slurpfile diff "${workdir}/diff.json" \
+            '. += $diff' <<<"${json}")
+        done < <(jq -c '.updates // [] | .[]' <<<'${{ steps.digestabot.outputs.json }}')
+
+        # Add the json output
+        echo "${json}" > /tmp/output.json
+
+    # Iterate over the output of the diff and:
+    # 1. Update the files that have changed
+    # 2. Construct the body of the PR
+    - id: update
+      shell: bash
+      run: |
+        # Open the body output
+        echo 'body<<EOF' >> "${GITHUB_OUTPUT}"
+
+        while read -r item; do
+          from_image=$(jq -r '.image + "@" + .digest' <<<$item)
+          to_image=$(jq -r '.image + "@" + .updated_digest' <<<$item)
+
+          # Skip the update if only-removed-vulnerabilities is set and there
+          # are no removed vulns
+          if [[ -z "$(jq -r  '.vulnerabilities.removed // [] | .[].id' <<<"${item}")" ]] && [[ '${{ inputs.only-removed-vulnerabilities }}' == 'true' ]]; then
+            echo "Skipping ${to_image} because it doesn't remove any vulnerabilities."
+            continue
+          fi
+
+          # Perform the updates
+          while read -r file; do
+            sed -i -e "s|$from_image|$to_image|g" "$file"
+          done < <(jq -r '.files // [] | .[]' <<<"${item}")
+
+          # Header information for the image
+          echo "## ${to_image%@*}" >> "${GITHUB_OUTPUT}"
+          echo "In: $(jq -r '[.files[] | "`" + . + "`"] | join(", ")' <<<"${item}")" >> "${GITHUB_OUTPUT}"
+          echo '|      | Digest               |' >> "${GITHUB_OUTPUT}"
+          echo '| ---- | -------------------- |' >> "${GITHUB_OUTPUT}"
+          echo "| From | \`${from_image#*@}\` |" >> "${GITHUB_OUTPUT}"
+          echo "| To   | \`${to_image#*@}\`   |" >> "${GITHUB_OUTPUT}"
+
+          # Put the vulnerability information in a collapsible details block. We need the
+          # newlines around the tag in order to maintain the formatting of other elements
+          # in the markdown.
+          echo  >> "${GITHUB_OUTPUT}"
+          echo '<details>' >> "${GITHUB_OUTPUT}"
+          echo >> "${GITHUB_OUTPUT}"
+
+          vulnerabilities=$(jq -r '.vulnerabilities.found // [] | .[] | "|[" + .id + "](" + .dataSource + ")|" + .severity + "|"' <<<"${item}")
+          if [[ -n "${vulnerabilities}" ]]; then
+            echo '### Vulnerabilities' >> "${GITHUB_OUTPUT}"
+            echo 'These are vulnerabilities that are present in the new image.' >> "${GITHUB_OUTPUT}"
+            echo '| Id | Severity |' >> "${GITHUB_OUTPUT}"
+            echo '| -- | -------- |' >> "${GITHUB_OUTPUT}"
+            echo "${vulnerabilities}" >> "${GITHUB_OUTPUT}"
+          fi
+
+          vulnerabilities_added=$(jq -r '.vulnerabilities.added // [] | .[] | "|[" + .id + "](" + .dataSource + ")|" + .severity + "|"' <<<"${item}")
+          if [[ -n "${vulnerabilities_added}" ]]; then
+            echo '### Vulnerabilities Added' >> "${GITHUB_OUTPUT}"
+            echo 'These are vulnerabilities that are introduced by the change.' >> "${GITHUB_OUTPUT}"
+            echo '| Id | Severity |' >> "${GITHUB_OUTPUT}"
+            echo '| -- | -------- |' >> "${GITHUB_OUTPUT}"
+            echo "${vulnerabilities_added}" >> "${GITHUB_OUTPUT}"
+          fi
+
+          vulnerabilities_removed=$(jq -r  '.vulnerabilities.removed // [] | .[] | "|[" + .id + "](" + .dataSource + ")|" + .severity + "|"' <<<"${item}")
+          if [[ -n "${vulnerabilities_removed}" ]]; then
+            echo '### Vulnerabilities Removed' >> "${GITHUB_OUTPUT}"
+            echo 'These are vulnerabilities that are resolved by the change.' >> "${GITHUB_OUTPUT}"
+            echo '| Id | Severity |' >> "${GITHUB_OUTPUT}"
+            echo '| -- | -------- |' >> "${GITHUB_OUTPUT}"
+            echo "${vulnerabilities_removed}" >> "${GITHUB_OUTPUT}"
+          fi
+
+          # If there are no changes then make that clear in the body.
+          if [[ -z "${vulnerabilities}" ]] && [[ -z "${vulnerabilities_added}" ]] && [[ -z "${vulnerabilities_removed}" ]]; then
+            echo "No changes." >> "${GITHUB_OUTPUT}"
+          fi
+
+          # Close the details block. We need the newlines around the tag in order to
+          # maintain the formatting of other elements in the markdown.
+          echo >> "${GITHUB_OUTPUT}"
+          echo '</details>' >> "${GITHUB_OUTPUT}"
+          echo >> "${GITHUB_OUTPUT}"
+        done < <(jq -c '. // [] | .[]' /tmp/output.json)
+
+        # Close the output
+        echo 'EOF' >> "${GITHUB_OUTPUT}"
+
+    # Check if we made any changes
+    - name: Check workspace
+      id: create_pr_update
+      env:
+        CREATE_PR: ${{ inputs.create-pr }}
+      shell: bash
+      run: |
+        git diff --stat
+        echo "create_pr_update=false" >> $GITHUB_OUTPUT
+        if [[ $(git diff --stat) != '' ]] && [[ "${CREATE_PR}" == 'true' ]]; then
+          echo "create_pr_update=true" >> $GITHUB_OUTPUT
+        fi
+
+    # Setup gitsign, if configured.
+    - uses: chainguard-dev/actions/setup-gitsign@57cb0b7560d9b9b081c15ac5ef689f73f4dda03e # main branch as of 2024-08-02
+      if: ${{ steps.create_pr_update.outputs.create_pr_update == 'true' && inputs.use-gitsign == 'true' }}
+
+    # Create the pull request ourself.
+    - name: Create Pull Request
+      uses: peter-evans/create-pull-request@5e914681df9dc83aa4e4905692ca88beb2f9e91f # v7.0.5
+      if: ${{ steps.create_pr_update.outputs.create_pr_update == 'true' }}
+      id: pull_request
+      with:
+        token: ${{ inputs.token }}
+        commit-message: ${{ inputs.commit-message }}
+        title: ${{ inputs.title-for-pr }}
+        body: |
+          ${{ inputs.description-for-pr }}
+          ${{ steps.update.outputs.body }}
+        labels: ${{ inputs.labels-for-pr }}
+        branch: ${{ inputs.branch-for-pr }}
+        signoff: ${{ inputs.signoff }}
+        committer: ${{ inputs.committer }}
+        author: ${{ inputs.author }}
+        sign-commits: ${{ inputs.use-gitsign != 'true' }} # Sign commits with github if gitsign is not configured
+        delete-branch: true
