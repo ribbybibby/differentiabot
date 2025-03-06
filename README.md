@@ -7,8 +7,8 @@ adding information about what has changed in a given image update.
 It uses [`grype`](https://github.com/anchore/grype) to identify what
 vulnerabilities have been added or removed.
 
-![example](./img/example0.png)
-![example](./img/example1.png)
+![example](./img/example0.png | width=100)
+![example](./img/example1.png | width=100)
 
 ## Usage
 
